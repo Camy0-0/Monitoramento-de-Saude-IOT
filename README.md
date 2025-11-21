@@ -3,14 +3,6 @@
 ## Resumo
 Projeto de monitoramento de sinais vitais (BPM, SpO2, temperatura, passos) com Arduino UNO R4 WiFi, sensores MAX30102, MLX90614 e MPU6050. Dados publicados via MQTT para broker e visualizados em dashboard.
 
-## Conteúdo do repositório
-- monitor_saude_uno_r4.ino  -> sketch Arduino
-- monitor_logger.py         -> script Python para log e comando
-- fritzing/                  -> arquivos .fzz e imagens do diagrama
-- fotos/                     -> fotos do protótipo montado
-- dados/                     -> CSV de exemplo
-- README.md
-
 ## Bibliotecas Arduino
 Instale via Library Manager:
 - Adafruit MAX30105
