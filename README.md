@@ -36,9 +36,6 @@ Tópicos:
 Exemplo payload:
 {"bpm":72,"spo2":97.2,"temp":36.5,"steps":123,"ts":1630000000}
 
-## Vídeo
-Insira link do vídeo demonstrando o funcionamento com MQTT (vídeo não listado).
-
 ## Observações
 - Ajuste parâmetros de sensoriamento e calibração.
 - O cálculo de SpO2 e BPM real exige implementação robusta de PPG (não apenas leituras brutas).
