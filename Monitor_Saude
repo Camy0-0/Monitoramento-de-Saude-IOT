@@ -1,271 +1,242 @@
-#include <Wire.h>
-#include <WiFi.h>             // Troque por WiFiNINA.h ou WiFiS3.h se necessário para sua UNO R4
+/*
+  monitor_saude_esp32_mqtt.ino
+  Simulação Wokwi + MQTT real via broker.emqx.io
+  - ESP32 DevKit V1
+  - LCD 16x2
+  - Potenciômetro simula PPG (A0 -> ADC32)
+  - LM35 (ADC34)
+  - LEDs, buzzer, botão de emergência
+  - Publica JSON em health/monitor/patient01 a cada 15s
+*/
+
+#include <WiFi.h>
 #include <PubSubClient.h>
+#include <LiquidCrystal.h>
 
-// Bibliotecas dos sensores (instale via Library Manager)
-#include <Adafruit_MAX30105.h>
-#include <Adafruit_MLX90614.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
+// ---------- USER CONFIG ----------
+const char* WIFI_SSID = "Wokwi-GUEST"; // troque se necessário
+const char* WIFI_PASS = "";
 
-// --- CONFIGURAÇÃO DO USUÁRIO ---
-const char* ssid = "SEU_SSID";
-const char* password = "SUA_SENHA_WIFI";
+const char* MQTT_SERVER = "broker.emqx.io";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_TOPIC = "health/monitor/patient01";
 
-const char* mqtt_server = "broker.hivemq.com"; // exemplo público; substitua por broker seguro
-const uint16_t mqtt_port = 1883;
-const char* mqtt_user = ""; // se houver
-const char* mqtt_pass = ""; // se houver
+// ---------- PINS (match diagram.json) ----------
+#define LCD_RS 12
+#define LCD_EN 14
+#define LCD_D4 27
+#define LCD_D5 26
+#define LCD_D6 25
+#define LCD_D7 33
 
-const char* topic_pub = "saude/camila/data";
-const char* topic_sub = "saude/camila/commands";
+#define PIN_POT 32     // ADC -> heart simulation
+#define PIN_LM35 34    // ADC -> temp sensor
+#define PIN_HEART_LED 15
+#define PIN_WIFI_LED 2
+#define PIN_BUZZER 4
+#define PIN_BTN 13
 
-const int BUZZER_PIN = 6;
-const int LED_R = 9;
-const int LED_G = 10;
-const int LED_B = 11;
+// ---------- TIMINGS ----------
+const unsigned long UPDATE_INTERVAL = 1000;    // LCD update (ms)
+const unsigned long MQTT_INTERVAL = 15000;     // MQTT publish (ms)
 
-const float SPO2_THRESHOLD = 90.0; // em %
-const float TEMP_THRESHOLD = 38.0; // em °C
-const int BPM_MIN = 45;
-const int BPM_MAX = 130;
+// ---------- GLOBALS ----------
+LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
-// --- OBJETOS / VARIÁVEIS ---
 WiFiClient espClient;
-PubSubClient client(espClient);
+PubSubClient mqttClient(espClient);
 
-Adafruit_MAX30105 maxSensor;
-Adafruit_MLX90614 mlx = Adafruit_MLX90614();
-Adafruit_MPU6050 mpu;
+float heartRate = 75.0;
+float temperatureC = 36.5;
+bool heartDetected = false;
+unsigned long lastBeat = 0;
+unsigned long lastUpdate = 0;
+unsigned long lastMqtt = 0;
+int beatCount = 0;
+bool emergencyFlag = false;
 
-unsigned long lastPublish = 0;
-const unsigned long PUBLISH_INTERVAL = 2000; // 2s
-
-// Funções adiante
-void mqttCallback(char* topic, byte* payload, unsigned int length);
-void reconnect();
-void setLEDColor(uint8_t r, uint8_t g, uint8_t b);
-void beepBuzzer(int ms);
-
-// --- SETUP ---
-void setup() {
-  Serial.begin(115200);
-  delay(100);
-
-  // pinos
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_R, OUTPUT);
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_B, OUTPUT);
-  setLEDColor(0, 0, 0);
-
-  // I2C
-  Wire.begin();
-
-  // inicializa sensores
-  if (!maxSensor.begin()) {
-    Serial.println("MAX30105 nao encontrado. Verifique conexoes.");
-  } else {
-    Serial.println("MAX30105 iniciado.");
-    // configurações iniciais sensoriamento (ajuste conforme necessidade)
-    maxSensor.setup(); // usa valores padrões; para maior robustez, ajustar led pulse, sample rate, etc.
-  }
-
-  if (!mlx.begin()) {
-    Serial.println("MLX90614 nao encontrado.");
-  } else {
-    Serial.println("MLX90614 iniciado.");
-  }
-
-  if (!mpu.begin()) {
-    Serial.println("MPU6050 nao encontrado.");
-  } else {
-    Serial.println("MPU6050 iniciado.");
-  }
-
-  // WiFi
-  Serial.println("Conectando WiFi...");
-  WiFi.begin(ssid, password);
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+// ---------- FUNCTIONS ----------
+void connectWiFi() {
+  Serial.print("Connecting to WiFi ");
+  Serial.print(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
-    retries++;
+    attempts++;
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi conectado.");
-    Serial.print("IP: ");
+    Serial.println("\nWiFi connected. IP:");
     Serial.println(WiFi.localIP());
-    setLEDColor(0, 0, 255); // azul = tentando envio
   } else {
-    Serial.println("\nFalha WiFi.");
-    setLEDColor(255, 0, 0); // vermelho
-  }
-
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-}
-
-// --- LOOP ---
-void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
-
-  unsigned long now = millis();
-  if (now - lastPublish >= PUBLISH_INTERVAL) {
-    lastPublish = now;
-
-    // Leitura MAX30102 -> estimativa de BPM e SPO2
-    // Nota: leituras PPG requerem processamento; aqui apresentamos exemplo simplificado.
-    float spo2 = NAN;
-    int bpm = 0;
-
-    // coletar amostra simples (para protótipo). Para produção, aplicar algoritmo PPG robusto.
-    if (maxSensor.available()) {
-      // lê valores brutos apenas para exemplo — para cálculo real, usar bibliotecas que retornam BPM/SpO2
-      long ir = maxSensor.getIR();
-      long red = maxSensor.getRed();
-      // Exemplo grosseiro de cálculo fictício (substituir por algoritmo real)
-      if (ir > 0) {
-        // pseudo-cálculo
-        bpm = 70 + (ir % 10); // apenas placeholder
-        spo2 = 95.0 + ((red - ir) % 3); // placeholder
-      }
-      maxSensor.nextSample();
-    } else {
-      // tente obter uma leitura solicitando sensoriamento
-      maxSensor.check(); // método dependendo da lib
-    }
-
-    // Leitura temperatura via MLX90614
-    float temp = mlx.readObjectTempC();
-
-    // Leitura MPU6050 -> passos (aqui usamos aceleração magnitude simplificada)
-    sensors_event_t a, g, tempEvent;
-    mpu.getEvent(&a, &g, &tempEvent);
-    float accelMagnitude = sqrt(a.acceleration.x*a.acceleration.x + a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z);
-    // heurística simples para passos (exemplo)
-    static int stepCount = 0;
-    if (accelMagnitude > 12.0) { // valor experimental
-      stepCount++;
-    }
-
-    // Monta payload JSON
-    String payload = "{";
-    payload += "\"bpm\":" + String(bpm) + ",";
-    payload += "\"spo2\":" + (isnan(spo2) ? String("null") : String(spo2,1)) + ",";
-    payload += "\"temp\":" + String(temp,2) + ",";
-    payload += "\"steps\":" + String(stepCount) + ",";
-    payload += "\"ts\":" + String(now);
-    payload += "}";
-
-    // Publica
-    Serial.print("Publicando: ");
-    Serial.println(payload);
-    if (client.publish(topic_pub, payload.c_str())) {
-      Serial.println("Publicado com sucesso.");
-      setLEDColor(0, 255, 0); // verde
-      delay(150);
-      setLEDColor(0, 0, 255); // volta azul (enviando)
-    } else {
-      Serial.println("Falha ao publicar.");
-      setLEDColor(255, 0, 0);
-    }
-
-    // Verifica se valores fora do normal -> aciona atuadores locais e publica alerta
-    bool alert = false;
-    String alertMsg = "";
-    if (!isnan(spo2) && spo2 < SPO2_THRESHOLD) {
-      alert = true;
-      alertMsg += "SpO2 baixo;";
-    }
-    if (temp > TEMP_THRESHOLD) {
-      alert = true;
-      alertMsg += "Temperatura alta;";
-    }
-    if (bpm < BPM_MIN || bpm > BPM_MAX) {
-      alert = true;
-      alertMsg += "BPM fora;";
-    }
-
-    if (alert) {
-      // aciona buzzer e LED vermelho
-      beepBuzzer(400);
-      setLEDColor(255, 0, 0);
-      // publica alerta
-      String apayload = "{\"alert\":1,\"message\":\"" + alertMsg + "\"}";
-      client.publish("saude/camila/alertas", apayload.c_str());
-    }
-  } // fim publish interval
-}
-
-// --- FUNCOES ---
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Mensagem recebida [");
-  Serial.print(topic);
-  Serial.println("]");
-
-  String msg = "";
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
-  Serial.print("Payload: ");
-  Serial.println(msg);
-
-  // Exemplo simples: comando JSON { "cmd":"buzz", "dur":500 } ou { "cmd":"led","color":"green" }
-  if (msg.indexOf("buzz") >= 0) {
-    // extrair duração se disponível
-    int dur = 300;
-    int idx = msg.indexOf("dur");
-    if (idx >= 0) {
-      // parsing simples
-      int colon = msg.indexOf(":", idx);
-      int comma = msg.indexOf(",", colon);
-      if (colon >= 0) {
-        String num = "";
-        for (int i = colon+1; i < colon+6 && i < (int)msg.length(); i++) {
-          if (isDigit(msg[i])) num += msg[i];
-        }
-        if (num.length()) dur = num.toInt();
-      }
-    }
-    beepBuzzer(dur);
-  } else if (msg.indexOf("led") >= 0) {
-    if (msg.indexOf("green") >= 0) setLEDColor(0,255,0);
-    else if (msg.indexOf("red") >= 0) setLEDColor(255,0,0);
-    else if (msg.indexOf("blue") >= 0) setLEDColor(0,0,255);
+    Serial.println("\nWiFi not connected (Wokwi guest may be used).");
   }
 }
 
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Conectando MQTT...");
-    String clientId = "UNO_R4_";
-    clientId += String(random(0xffff), HEX);
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-      Serial.println("conectado");
-      // se conectado, subscribe
-      client.subscribe(topic_sub);
+void connectMQTT() {
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    String clientId = String("ESP32_Health_") + String(random(0xffff), HEX);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("connected");
     } else {
-      Serial.print("falha, rc=");
-      Serial.print(client.state());
-      Serial.println(" tentando novamente em 2s");
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state());
       delay(2000);
     }
   }
 }
 
-void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
-  analogWrite(LED_R, r);
-  analogWrite(LED_G, g);
-  analogWrite(LED_B, b);
+void publishToMQTT() {
+  if (!mqttClient.connected()) connectMQTT();
+  String payload = "{";
+  payload += "\"bpm\":" + String(heartRate,1) + ",";
+  payload += "\"temp\":" + String(temperatureC,1) + ",";
+  payload += "\"beats\":" + String(beatCount) + ",";
+  payload += "\"state\":\"" + String(emergencyFlag ? "emergency" : "normal") + "\",";
+  payload += "\"ts\":" + String(millis()/1000);
+  payload += "}";
+  bool ok = mqttClient.publish(MQTT_TOPIC, payload.c_str());
+  Serial.println(String("Published MQTT: ") + payload + " -> " + (ok?"OK":"FAIL"));
+  digitalWrite(PIN_WIFI_LED, HIGH);
+  delay(500);
+  digitalWrite(PIN_WIFI_LED, LOW);
 }
 
-void beepBuzzer(int ms) {
-  digitalWrite(BUZZER_PIN, HIGH);
-  delay(ms);
-  digitalWrite(BUZZER_PIN, LOW);
+void detectHeartbeat(int rawSignal) {
+  static int threshold = 600; // for simulated ADC range (0-4095)
+  static bool wasHigh = false;
+  static unsigned long lastDetection = 0;
+
+  if (rawSignal > threshold && !wasHigh) {
+    wasHigh = true;
+    unsigned long now = millis();
+    if (lastBeat > 0) {
+      unsigned long interval = now - lastBeat;
+      if (interval > 300 && interval < 2000) {
+        float instHR = 60000.0 / interval;
+        static float smoothed = instHR;
+        smoothed = smoothed * 0.7 + instHR * 0.3;
+        heartRate = smoothed;
+        beatCount++;
+        // blink
+        digitalWrite(PIN_HEART_LED, HIGH);
+        delay(25);
+        digitalWrite(PIN_HEART_LED, LOW);
+        heartDetected = true;
+        lastDetection = now;
+      }
+    }
+    lastBeat = now;
+  }
+
+  if (rawSignal < threshold - 100) wasHigh = false;
+
+  if (millis() - lastDetection > 2000) {
+    heartDetected = false;
+  }
+}
+
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("BPM:");
+  if (heartRate < 100) lcd.print(" ");
+  lcd.print((int)heartRate);
+  lcd.setCursor(11,0);
+  lcd.print(beatCount % 10);
+
+  lcd.setCursor(0,1);
+  lcd.print("T:");
+  lcd.print(temperatureC,1);
+  lcd.print((char)223);
+  lcd.print("C ");
+  if (millis() - lastMqtt < 2000) lcd.print("W");
+}
+
+void checkAlarms() {
+  if (emergencyFlag) {
+    tone(PIN_BUZZER, 2000, 200);
+    return;
+  }
+  if (heartRate > 120 || heartRate < 50) {
+    // critical
+    tone(PIN_BUZZER, 1500, 300);
+  } else if (temperatureC > 38.0) {
+    tone(PIN_BUZZER, 1200, 300);
+  }
+}
+
+void handleButton() {
+  static bool lastState = HIGH;
+  bool cur = digitalRead(PIN_BTN);
+  if (lastState == HIGH && cur == LOW) {
+    emergencyFlag = !emergencyFlag;
+    Serial.println(String("Emergency toggled: ") + (emergencyFlag?"ON":"OFF"));
+    delay(50);
+  }
+  lastState = cur;
+}
+
+// ---------- SETUP & LOOP ----------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(PIN_HEART_LED, OUTPUT);
+  pinMode(PIN_WIFI_LED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_BTN, INPUT_PULLUP);
+
+  lcd.begin(16,2);
+  lcd.print("Health Monitor");
+  lcd.setCursor(0,1);
+  lcd.print("ESP32 + MQTT");
+  delay(1500);
+
+  connectWiFi();
+  connectMQTT();
+
+  lastUpdate = millis();
+  lastMqtt = millis();
+}
+
+void loop() {
+  mqttClient.loop();
+  unsigned long now = millis();
+
+  // Read simulated sensors
+  int pot = analogRead(PIN_POT);   // 0-4095
+  int lm = analogRead(PIN_LM35);   // 0-4095
+
+  // Convert LM35 (assumes 3.3V ADC ref in Wokwi) => scale to 5V behaviour for LM35
+  // In Wokwi, LM35 tied to 3.3V: voltage = raw*(3.3/4095)
+  float voltage = lm * (3.3 / 4095.0);
+  // If you expect 5V LM35, scale accordingly. Here we map to Celsius:
+  temperatureC = voltage * 100.0; // LM35 ~10mV/°C, mapping 0-330C (but sim uses safe range)
+
+  // Simulated heart detection (pot maps to 0-4095)
+  detectHeartbeat(pot);
+
+  // Button emergency
+  handleButton();
+
+  // Update LCD periodically
+  if (now - lastUpdate >= UPDATE_INTERVAL) {
+    updateLCD();
+    lastUpdate = now;
+  }
+
+  // Publish to MQTT periodically
+  if (now - lastMqtt >= MQTT_INTERVAL) {
+    publishToMQTT();
+    lastMqtt = now;
+  }
+
+  // Check alarms
+  checkAlarms();
+
+  delay(50);
 }
