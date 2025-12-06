@@ -1,33 +1,31 @@
-# Monitoramento de Saúde com Arduino UNO R4 WiFi e MQTT
+# Sistema de Monitoramento de Saúde — Wokwi + ESP32 + MQTT
 
-## Resumo
-Projeto de monitoramento de sinais vitais (BPM, SpO2, temperatura, passos) com Arduino UNO R4 WiFi, sensores MAX30102, MLX90614 e MPU6050. Dados publicados via MQTT para broker e visualizados em dashboard.
+Projeto final (Universidade Presbiteriana Mackenzie)
+Simulação completa em Wokwi com ESP32 e publicação MQTT real (broker.emqx.io).
 
-## Bibliotecas Arduino
-Instale via Library Manager:
-- Adafruit MAX30105
-- Adafruit MLX90614
-- Adafruit MPU6050
-- PubSubClient
-- (WiFi library adequada para UNO R4 WiFi)
+## Estrutura
+- `diagram.json` — projeto Wokwi (ESP32 + LCD + LM35 + pot + LEDs + buzzer + botão)
+- `monitor_saude_esp32_mqtt.ino` — firmware Arduino (ESP32)
+- `README.md` — este arquivo
 
-## Wiring (resumo)
-- SDA -> A4
-- SCL -> A5
-- MAX30102 Vcc -> 3.3V (ou 5V conforme versão), GND
-- MLX90614 Vcc -> 3.3V, GND
-- MPU6050 Vcc -> 3.3V, GND
-- Buzzer -> D6 (com resistor/transistor se necessário)
-- LED R/G/B -> D9/D10/D11 (com resistores)
+## Como usar (Wokwi)
+1. Abra https://wokwi.com
+2. Importe `diagram.json` (Upload Project)
+3. Abra o `monitor_saude_esp32_mqtt.ino` no editor Wokwi (ou copie/cole)
+4. Ajuste `WIFI_SSID` e `WIFI_PASS` se desejar
+5. Execute a simulação
 
-## MQTT
-Tópicos:
-- Publish: saude/camila/data (JSON)
-- Subscribe: saude/camila/commands
+## Conectar ao MQTT Explorer
+1. Baixe e abra MQTT Explorer
+2. New Connection:
+   - Host: `broker.emqx.io`
+   - Port: `1883`
+   - Client ID: (qualquer)
+3. Connect → observe o tópico `health/monitor/patient01` receber JSONs a cada 15s
 
-Exemplo payload:
-{"bpm":72,"spo2":97.2,"temp":36.5,"steps":123,"ts":1630000000}
-
-## Observações
-- Ajuste parâmetros de sensoriamento e calibração.
-- O cálculo de SpO2 e BPM real exige implementação robusta de PPG (não apenas leituras brutas).
+## Notas
+- O código está preparado para Wokwi (ESP32 ADC e 3.3V)
+- Para migrar para hardware real: use ESP32 DevKit, verifique alimentação do LM35 e calibragem ADC
+- Topic JSON example:
+  ```json
+  {"bpm":75.3,"temp":36.6,"beats":12,"state":"normal","ts":1650000000}
